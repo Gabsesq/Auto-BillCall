@@ -1,23 +1,23 @@
 """
 Pet Releaf — Billing Failure Webhook Server
 Listens for Smartrr "Subscription failed payment" events, stores failures,
-and places an automated outbound call via Plivo (once daily by default).
+and places an automated outbound call via Twilio (once daily by default).
 
 How the call works:
   1. Daily worker (or webhook, if enabled) schedules outbound calls
-  2. Plivo calls the customer's phone
+  2. Twilio calls the customer's phone
   3. If a human answers  → plays the message
   4. If voicemail/AMD detected → waits for beep, then plays the message
   5. Call ends cleanly
 
 Requirements:
-    pip install flask plivo python-dotenv
+    pip install flask twilio python-dotenv
 
 Environment variables (copy .env.example → .env and fill in values):
-    PLIVO_AUTH_ID        - From Plivo console overview page
-    PLIVO_AUTH_TOKEN     - From Plivo console overview page
-    PLIVO_FROM_NUMBER    - Your Plivo number in E.164 format e.g. +17205551234
-    ANSWER_URL           - Public URL of THIS server + /answer
+    TWILIO_ACCOUNT_SID   - From Twilio console
+    TWILIO_AUTH_TOKEN    - From Twilio console
+    TWILIO_FROM_NUMBER   - Your Twilio number in E.164 format e.g. +17205551234
+    ANSWER_URL           - Public URL of THIS server + /answer (TwiML webhook)
                            e.g. https://your-app.railway.app/answer
     PAYMENT_UPDATE_URL   - Page where customers update payment info
     WEBHOOK_SECRET       - Optional: secret to verify Smartrr requests
@@ -28,14 +28,14 @@ into Smartrr → Integrations → Webhooks → Subscription failed payment.
 
 import os
 import logging
-import plivo  # type: ignore
 import sqlite3
 import time
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, Response
-from plivo import plivoxml  # type: ignore
 from dotenv import load_dotenv
+from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse
 
 load_dotenv()
 
@@ -45,12 +45,12 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PLIVO_AUTH_ID      = os.getenv("PLIVO_AUTH_ID")
-PLIVO_AUTH_TOKEN   = os.getenv("PLIVO_AUTH_TOKEN")
-PLIVO_FROM_NUMBER  = os.getenv("PLIVO_FROM_NUMBER")
-ANSWER_URL         = os.getenv("ANSWER_URL")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
+ANSWER_URL = os.getenv("ANSWER_URL")
 PAYMENT_UPDATE_URL = os.getenv("PAYMENT_UPDATE_URL", "https://www.petreleaf.com/account")
-WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 DB_PATH = os.getenv("DB_PATH", "billing_failures.db")
 
@@ -69,7 +69,7 @@ MAX_FAILURE_AGE_DAYS = int(os.getenv("MAX_FAILURE_AGE_DAYS", "30"))
 # Optional shared secret for manual triggering of the daily job.
 DAILY_JOB_SECRET = os.getenv("DAILY_JOB_SECRET") or WEBHOOK_SECRET
 
-client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 VOICEMAIL_MESSAGE = (
     "Hi, this is a message from Pet Releaf. "
@@ -263,36 +263,41 @@ def normalize_extract_customer_info(payload: dict) -> tuple[str | None, str, str
 
 
 def place_voicemail_call(phone: str):
-    # Plivo fetches this XML the moment the call is answered — human or voicemail.
-    # (Same voicemail message for every customer.)
-    response = client.calls.create(
-        from_=PLIVO_FROM_NUMBER,
+    # Twilio fetches this TwiML when the call is answered (human or voicemail).
+    call = client.calls.create(
         to_=phone,
-        answer_url=ANSWER_URL,
-        answer_method="GET",
-        machine_detection="true",  # wait for beep, then play message
+        from_=TWILIO_FROM_NUMBER,
+        url=ANSWER_URL,
+        method="GET",
+        # Ask Twilio to classify what answered so we can avoid calling humans.
+        machine_detection="Enable",
     )
-    request_uuid = response[1].get("request_uuid", "unknown")
-    return request_uuid
+    return call.sid
 
 # ── Answer URL ────────────────────────────────────────────────────────────────
-# Plivo fetches this XML the moment the call is answered — human or voicemail.
-# We use Amazon Polly via Plivo's <Speak> for a natural-sounding voice.
-# To use a pre-recorded audio file instead, swap <Speak> for:
-#   <Play>https://your-server.com/static/billing_message.mp3</Play>
+# Twilio fetches this TwiML the moment the call is answered (human or voicemail).
 
 @app.route("/answer", methods=["GET", "POST"])
 def answer():
-    response = plivoxml.ResponseElement()
-    response.add(
-        plivoxml.SpeakElement(
-            VOICEMAIL_MESSAGE,
-            voice="Polly.Joanna",  # Natural US female voice via Amazon Polly
-            language="en-US",
-        )
-    )
+    # Twilio passes `AnsweredBy` when machine detection is enabled.
+    # Common values: human, machine_start, machine_end, fax, unknown.
+    answered_by = (request.values.get("AnsweredBy") or "").strip().lower()
 
-    return Response(response.to_string(), mimetype="application/xml")
+    resp = VoiceResponse()
+
+    # Keep it "voicemail-only" as much as possible.
+    # If Twilio thinks a human (or fax/unknown) answered, hang up.
+    if answered_by in {"human", "fax", "unknown"}:
+        resp.hangup()
+        return Response(resp.to_xml(), mimetype="text/xml")
+
+    # Otherwise, play the voicemail reminder message.
+    resp.say(
+        VOICEMAIL_MESSAGE,
+        voice="Polly.Joanna",
+        language="en-US",
+    )
+    return Response(resp.to_xml(), mimetype="text/xml")
 
 
 # ── Billing Failure Webhook ───────────────────────────────────────────────────
@@ -344,7 +349,7 @@ def billing_failure():
         ), 200
 
     except Exception as e:
-        logger.error(f"Plivo call failed → {phone}: {str(e)}")
+        logger.error(f"Twilio call failed → {phone}: {str(e)}")
         return jsonify({"status": "call_failed", "error": str(e)}), 500
 
 
