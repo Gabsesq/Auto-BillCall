@@ -422,6 +422,12 @@ def billing_failure():
 
 # ── Health Check ──────────────────────────────────────────────────────────────
 
+@app.route("/", methods=["GET"])
+def root():
+    # Some hosts default health checks to "/" — must return 200.
+    return jsonify({"status": "ok", "service": "auto-billcall"}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
@@ -556,7 +562,11 @@ def _maybe_start_scheduler_thread():
 
 
 # DB schema needed for `gunicorn billing_webhook:app` (no __main__ block runs).
-_db_init()
+# Do not let a bad path/permissions take down the whole app (Railway health checks need / and /health).
+try:
+    _db_init()
+except Exception:
+    logger.exception("Database init failed at import — fix DB_PATH or volume permissions")
 
 # Flask 2.2+: start scheduler once per worker (gunicorn + `python billing_webhook.py`).
 if hasattr(app, "before_serving"):
