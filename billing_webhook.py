@@ -42,6 +42,19 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def _env_int(name: str, default: int) -> int:
+    """Avoid startup crash if Railway has an empty or invalid numeric env var."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid integer for {name}={raw!r} — using default {default}")
+        return default
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -60,14 +73,14 @@ DB_PATH = os.getenv("DB_PATH", "billing_failures.db")
 CALL_ON_WEBHOOK = os.getenv("CALL_ON_WEBHOOK", "false").lower() == "true"
 
 # Minimum days between voicemail reminders for the same phone (while still failed).
-REMINDER_INTERVAL_DAYS = int(os.getenv("REMINDER_INTERVAL_DAYS", "30"))
+REMINDER_INTERVAL_DAYS = _env_int("REMINDER_INTERVAL_DAYS", 30)
 
 # Scheduler: how often to scan for due reminders (seconds). 86400 = once per day.
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "false").lower() == "true"
-DAILY_CALL_INTERVAL_SECONDS = int(os.getenv("DAILY_CALL_INTERVAL_SECONDS", "86400"))
-DAILY_CALL_MAX_BATCH = int(os.getenv("DAILY_CALL_MAX_BATCH", "200"))
+DAILY_CALL_INTERVAL_SECONDS = _env_int("DAILY_CALL_INTERVAL_SECONDS", 86400)
+DAILY_CALL_MAX_BATCH = _env_int("DAILY_CALL_MAX_BATCH", 200)
 # Drop failures older than this from reminders (set high if you only use monthly calls).
-MAX_FAILURE_AGE_DAYS = int(os.getenv("MAX_FAILURE_AGE_DAYS", "365"))
+MAX_FAILURE_AGE_DAYS = _env_int("MAX_FAILURE_AGE_DAYS", 365)
 
 # Optional shared secret for manual triggering of the daily job.
 DAILY_JOB_SECRET = os.getenv("DAILY_JOB_SECRET") or WEBHOOK_SECRET
@@ -530,17 +543,33 @@ def daily_worker_loop():
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
+def _maybe_start_scheduler_thread():
+    if not SCHEDULER_ENABLED:
+        return
+    logger.info(
+        f"Starting daily worker thread (interval_seconds={DAILY_CALL_INTERVAL_SECONDS})"
+    )
+    import threading
+
+    t = threading.Thread(target=daily_worker_loop, daemon=True)
+    t.start()
+
+
+# DB schema needed for `gunicorn billing_webhook:app` (no __main__ block runs).
+_db_init()
+
+# Flask 2.2+: start scheduler once per worker (gunicorn + `python billing_webhook.py`).
+if hasattr(app, "before_serving"):
+
+    @app.before_serving
+    def _scheduler_on_startup():
+        _maybe_start_scheduler_thread()
+
+
 if __name__ == "__main__":
-    _db_init()
+    # Old Flask without `before_serving`: start scheduler here only.
+    if not hasattr(app, "before_serving"):
+        _maybe_start_scheduler_thread()
 
-    if SCHEDULER_ENABLED:
-        logger.info(
-            f"Starting daily worker thread (interval_seconds={DAILY_CALL_INTERVAL_SECONDS})"
-        )
-        import threading
-
-        t = threading.Thread(target=daily_worker_loop, daemon=True)
-        t.start()
-
-    port = int(os.getenv("PORT", 5000))
+    port = _env_int("PORT", 5000)
     app.run(host="0.0.0.0", port=port)
