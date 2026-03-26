@@ -1,5 +1,13 @@
-# Railway deploy hints — see https://docs.railway.com/reference/config-as-code
+# Railway: config-as-code overrides the service dashboard for these fields.
+# See https://docs.railway.com/guides/config-as-code
+
 [deploy]
+# Must listen on 0.0.0.0:$PORT (Railway sets PORT).
+startCommand = "python -m gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 120 --access-logfile - --error-logfile - billing_webhook:app"
 healthcheckPath = "/health"
-# Seconds to wait for the service to respond before marking unhealthy (worker import can be slow).
 healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+# Keep old instance up briefly during deploy so public traffic is not dropped mid-swap.
+overlapSeconds = "60"
+drainingSeconds = "30"
