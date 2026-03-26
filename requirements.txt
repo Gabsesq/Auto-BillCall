@@ -1,0 +1,3 @@
+flask
+plivo
+python-dotenv
