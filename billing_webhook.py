@@ -85,7 +85,15 @@ MAX_FAILURE_AGE_DAYS = _env_int("MAX_FAILURE_AGE_DAYS", 365)
 # Optional shared secret for manual triggering of the daily job.
 DAILY_JOB_SECRET = os.getenv("DAILY_JOB_SECRET") or WEBHOOK_SECRET
 
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+_twilio_client: Client | None = None
+
+
+def get_twilio_client() -> Client:
+    """Create client on first use so bad/missing env does not break app import (e.g. /health)."""
+    global _twilio_client
+    if _twilio_client is None:
+        _twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return _twilio_client
 
 _DEFAULT_VOICEMAIL_MESSAGE = (
     "Hi, this is a message from Pet Releaf. "
@@ -320,7 +328,7 @@ def normalize_extract_customer_info(payload: dict) -> tuple[str | None, str, str
 
 def place_voicemail_call(phone: str):
     # Twilio fetches this TwiML when the call is answered (human or voicemail).
-    call = client.calls.create(
+    call = get_twilio_client().calls.create(
         to_=phone,
         from_=TWILIO_FROM_NUMBER,
         url=ANSWER_URL,
@@ -422,15 +430,15 @@ def billing_failure():
 
 # ── Health Check ──────────────────────────────────────────────────────────────
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "HEAD"])
 def root():
-    # Some hosts default health checks to "/" — must return 200.
-    return jsonify({"status": "ok", "service": "auto-billcall"}), 200
+    # Plain text + HEAD: avoids any JSON edge cases with host health probes.
+    return Response("ok\n", status=200, mimetype="text/plain")
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/health", methods=["GET", "HEAD"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return Response("ok\n", status=200, mimetype="text/plain")
 
 
 @app.route("/billing-success", methods=["POST"])
@@ -568,18 +576,10 @@ try:
 except Exception:
     logger.exception("Database init failed at import — fix DB_PATH or volume permissions")
 
-# Flask 2.2+: start scheduler once per worker (gunicorn + `python billing_webhook.py`).
-if hasattr(app, "before_serving"):
-
-    @app.before_serving
-    def _scheduler_on_startup():
-        _maybe_start_scheduler_thread()
-
+# Gunicorn: do not use Flask's before_serving (it is not reliable with production WSGI servers).
+_maybe_start_scheduler_thread()
+logger.info("billing_webhook loaded (gunicorn worker ready for requests)")
 
 if __name__ == "__main__":
-    # Old Flask without `before_serving`: start scheduler here only.
-    if not hasattr(app, "before_serving"):
-        _maybe_start_scheduler_thread()
-
     port = _env_int("PORT", 5000)
     app.run(host="0.0.0.0", port=port)

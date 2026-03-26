@@ -1,0 +1,5 @@
+# Railway deploy hints — see https://docs.railway.com/reference/config-as-code
+[deploy]
+healthcheckPath = "/health"
+# Seconds to wait for the service to respond before marking unhealthy (worker import can be slow).
+healthcheckTimeout = 300
