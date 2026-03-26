@@ -1,14 +1,13 @@
 """
 Pet Releaf — Billing Failure Webhook Server
 Listens for Smartrr "Subscription failed payment" events, stores failures,
-and places an automated outbound call via Twilio (once daily by default).
+and places an automated outbound call via Twilio.
 
 How the call works:
-  1. Daily worker (or webhook, if enabled) schedules outbound calls
+  1. On billing failure, optionally call immediately (if due) or wait for the scheduler
   2. Twilio calls the customer's phone
-  3. If a human answers  → plays the message
-  4. If voicemail/AMD detected → waits for beep, then plays the message
-  5. Call ends cleanly
+  3. Voicemail-style: machine answers get the message; humans/fax/unknown hang up
+  4. Repeats on a schedule (default: every 30 days) until payment succeeds or cancel
 
 Requirements:
     pip install flask twilio python-dotenv
@@ -55,29 +54,35 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 DB_PATH = os.getenv("DB_PATH", "billing_failures.db")
 
 # Webhook behavior:
-# - If CALL_ON_WEBHOOK=true, the server places the call immediately.
-# - If false (default), it only stores failures and a daily job will call later.
+# - If CALL_ON_WEBHOOK=true, the server may place a call when Smartrr POSTs
+#   (only if no reminder was sent yet, or the last one was REMINDER_INTERVAL_DAYS ago).
+# - If false (default), it only stores failures; the scheduler or /run-daily-calls places calls.
 CALL_ON_WEBHOOK = os.getenv("CALL_ON_WEBHOOK", "false").lower() == "true"
 
-# Daily batching behavior:
-# - "daily worker" runs once on startup (if enabled) and then every N seconds.
+# Minimum days between voicemail reminders for the same phone (while still failed).
+REMINDER_INTERVAL_DAYS = int(os.getenv("REMINDER_INTERVAL_DAYS", "30"))
+
+# Scheduler: how often to scan for due reminders (seconds). 86400 = once per day.
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "false").lower() == "true"
 DAILY_CALL_INTERVAL_SECONDS = int(os.getenv("DAILY_CALL_INTERVAL_SECONDS", "86400"))
 DAILY_CALL_MAX_BATCH = int(os.getenv("DAILY_CALL_MAX_BATCH", "200"))
-MAX_FAILURE_AGE_DAYS = int(os.getenv("MAX_FAILURE_AGE_DAYS", "30"))
+# Drop failures older than this from reminders (set high if you only use monthly calls).
+MAX_FAILURE_AGE_DAYS = int(os.getenv("MAX_FAILURE_AGE_DAYS", "365"))
 
 # Optional shared secret for manual triggering of the daily job.
 DAILY_JOB_SECRET = os.getenv("DAILY_JOB_SECRET") or WEBHOOK_SECRET
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-VOICEMAIL_MESSAGE = (
+_DEFAULT_VOICEMAIL_MESSAGE = (
     "Hi, this is a message from Pet Releaf. "
     "We noticed an issue processing your recent subscription payment. "
     "Please visit petreleaf dot com and update your payment information, "
     "or call us back and we will be happy to help. "
     "Thank you and have a wonderful day!"
 )
+# Optional: set VOICEMAIL_MESSAGE in Railway to change text without redeploying code.
+VOICEMAIL_MESSAGE = os.getenv("VOICEMAIL_MESSAGE") or _DEFAULT_VOICEMAIL_MESSAGE
 
 
 def _utc_now_iso() -> str:
@@ -91,6 +96,41 @@ def _utc_today_yyyy_mm_dd() -> str:
 def _utc_cutoff_iso_days_ago(days: int) -> str:
     cutoff = datetime.now(timezone.utc).timestamp() - (days * 86400)
     return datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+
+
+def _days_since_last_reminder(last_called_date: str | None) -> float | None:
+    """last_called_date is stored as YYYY-MM-DD (UTC day of last outbound reminder)."""
+    if not last_called_date:
+        return None
+    try:
+        day = last_called_date.strip()[:10]
+        last = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (now - last).total_seconds() / 86400.0
+    except ValueError:
+        return None
+
+
+def is_due_for_reminder_call(last_called_date: str | None) -> bool:
+    """True if we have never reminded, or the last reminder was long enough ago."""
+    if last_called_date is None:
+        return True
+    days = _days_since_last_reminder(last_called_date)
+    if days is None:
+        return True
+    return days >= REMINDER_INTERVAL_DAYS
+
+
+def get_last_called_date(phone: str) -> str | None:
+    conn = _db_connect()
+    try:
+        row = conn.execute(
+            "SELECT last_called_date FROM failed_payments WHERE phone = ?",
+            (phone,),
+        ).fetchone()
+        return row["last_called_date"] if row else None
+    finally:
+        conn.close()
 
 
 def _db_connect():
@@ -166,7 +206,7 @@ def upsert_failure(phone: str, name: str, email: str):
         conn.close()
 
 
-def get_due_failures(today_yyyy_mm_dd: str, cutoff_iso: str, limit: int):
+def get_due_failures(cutoff_iso: str, limit: int):
     conn = _db_connect()
     try:
         rows = conn.execute(
@@ -174,12 +214,15 @@ def get_due_failures(today_yyyy_mm_dd: str, cutoff_iso: str, limit: int):
             SELECT phone, name, email
             FROM failed_payments
             WHERE resolved_at IS NULL
-              AND (last_called_date IS NULL OR last_called_date != ?)
               AND last_failure_at >= ?
+              AND (
+                last_called_date IS NULL
+                OR (julianday('now') - julianday(last_called_date)) >= ?
+              )
             ORDER BY last_failure_at DESC
             LIMIT ?
             """,
-            (today_yyyy_mm_dd, cutoff_iso, limit),
+            (cutoff_iso, REMINDER_INTERVAL_DAYS, limit),
         ).fetchall()
         return rows
     finally:
@@ -334,11 +377,22 @@ def billing_failure():
         logger.info(f"No phone number on file for {name} ({email}) — skipping call")
         return jsonify({"status": "no_phone", "email": email}), 200
 
-    # Store the failure so the daily job can call it once per day.
+    # Store the failure; reminders run on an interval until resolved or cancel.
     upsert_failure(phone=phone, name=name, email=email)
+    last_called = get_last_called_date(phone)
 
     if not CALL_ON_WEBHOOK:
-        return jsonify({"status": "queued_for_daily", "to": phone}), 200
+        return jsonify({"status": "queued_for_reminder", "to": phone}), 200
+
+    if not is_due_for_reminder_call(last_called):
+        return jsonify(
+            {
+                "status": "skipped_not_due_yet",
+                "to": phone,
+                "last_reminder_day": last_called,
+                "reminder_interval_days": REMINDER_INTERVAL_DAYS,
+            }
+        ), 200
 
     try:
         request_uuid = place_voicemail_call(phone)
@@ -386,6 +440,31 @@ def billing_success():
     return jsonify({"status": "resolved", "to": phone}), 200
 
 
+@app.route("/subscription-cancel", methods=["POST"])
+def subscription_cancel():
+    """
+    Stops reminders when a subscription is cancelled (same effect as payment success).
+    Add in Smartrr → Webhooks → Subscription cancel → this URL (same ?secret= as other webhooks).
+    """
+    if WEBHOOK_SECRET:
+        incoming = request.headers.get("X-Smartrr-Secret") or request.args.get("secret")
+        if incoming != WEBHOOK_SECRET:
+            logger.warning("Invalid webhook secret — rejected")
+            return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"error": "Invalid payload"}), 400
+
+    phone, name, email = normalize_extract_customer_info(payload)
+    if not phone:
+        return jsonify({"status": "no_phone"}), 200
+
+    logger.info(f"Subscription cancel received: {name} | phone: {phone} | email: {email}")
+    mark_resolved(phone=phone)
+    return jsonify({"status": "cancelled_stopped_reminders", "to": phone}), 200
+
+
 @app.route("/run-daily-calls", methods=["POST"])
 def run_daily_calls():
     """
@@ -405,7 +484,6 @@ def run_daily_calls():
 def run_due_calls_once(today: str):
     cutoff_iso = _utc_cutoff_iso_days_ago(MAX_FAILURE_AGE_DAYS)
     due_rows = get_due_failures(
-        today_yyyy_mm_dd=today,
         cutoff_iso=cutoff_iso,
         limit=DAILY_CALL_MAX_BATCH,
     )
